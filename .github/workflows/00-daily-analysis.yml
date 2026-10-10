@@ -1,10 +1,10 @@
 name: 每日股票分析
 
 on:
-  # 定时触发 - 交易日北京时间 08:45 与 18:00
+  # 定时触发 - 中国交易日北京时间 09:20（早盘盘前指导）与 14:50（尾盘交易指导）
   schedule:
-    - cron: '45 0 * * 1-5'     # 周一到周五，UTC 00:45 = 北京时间 08:45（早盘速递）
-    - cron: '0 10 * * 1-5'     # 周一到周五，UTC 10:00 = 北京时间 18:00（晚间复盘）
+    - cron: '20 1 * * 1-5'     # 周一到周五，UTC 01:20 = 北京时间 09:20（早盘盘前指导）
+    - cron: '50 6 * * 1-5'     # 周一到周五，UTC 06:50 = 北京时间 14:50（尾盘交易指导）
   
   # 手动触发
   workflow_dispatch:
@@ -12,9 +12,10 @@ on:
       mode:
         description: '运行模式'
         required: true
-        default: 'full'
+        default: 'ict-sector'
         type: choice
         options:
+          - ict-sector    # ICT 板块结构机会日报（纯板块+手机端图文并茂）
           - full          # 完整分析（股票+大盘）
           - market-only   # 仅大盘复盘
           - stocks-only   # 仅股票分析
@@ -532,10 +533,23 @@ jobs:
             python main.py --market-review $FORCE_RUN_ARG
           elif [ "$MODE" = "stocks-only" ]; then
             python main.py --no-market-review $FORCE_RUN_ARG
-          else
+          elif [ "$MODE" = "full" ]; then
             python main.py $FORCE_RUN_ARG
+          else
+            # 默认模式: ICT 板块结构机会日报（手机端极简，纯板块，图文并茂）
+            python src/services/ict_sector_reporter.py $FORCE_RUN_ARG
           fi
-      
+
+      - name: 生成并推送战术复盘长图海报
+        if: always() && (github.event.inputs.mode == 'full' || github.event.inputs.mode == 'market-only')
+        env:
+          FEISHU_APP_ID: ${{ secrets.FEISHU_APP_ID }}
+          FEISHU_APP_SECRET: ${{ secrets.FEISHU_APP_SECRET }}
+          FEISHU_CHAT_ID: ${{ secrets.FEISHU_CHAT_ID }}
+        run: |
+          sudo apt-get install -y fonts-wqy-microhei || true
+          python src/services/poster_sender.py || true
+
       - name: 上传分析报告
         uses: actions/upload-artifact@v6
         if: always()
