@@ -1,10 +1,10 @@
 name: 每日股票分析
 
 on:
-  # 定时触发 - 中国交易日北京时间 09:20（早盘盘前指导）与 14:50（尾盘交易指导）
+  # 定时触发 - 提前15分钟启动以抵消 GitHub Actions 排队延迟，脚本内精准对齐至北京时间 09:20 与 14:50 推送
   schedule:
-    - cron: '20 1 * * 1-5'     # 周一到周五，UTC 01:20 = 北京时间 09:20（早盘盘前指导）
-    - cron: '50 6 * * 1-5'     # 周一到周五，UTC 06:50 = 北京时间 14:50（尾盘交易指导）
+    - cron: '5 1 * * 1-5'      # 周一到周五，UTC 01:05 启动 -> 精准对齐北京时间 09:20:00（早盘盘前指导）
+    - cron: '35 6 * * 1-5'     # 周一到周五，UTC 06:35 启动 -> 精准对齐北京时间 14:50:00（尾盘交易指导）
   
   # 手动触发
   workflow_dispatch:
@@ -40,9 +40,6 @@ jobs:
     timeout-minutes: ${{ fromJSON(vars.ANALYSIS_TIMEOUT_MINUTES || '30') }}
     
     steps:
-      - name: 随机延迟（避免固定时间访问）
-        run: sleep $((RANDOM % 60))  # 随机延迟0-60秒启动
-      
       - name: 检出代码
         uses: actions/checkout@v5
       
@@ -52,11 +49,16 @@ jobs:
           python-version: '3.11'
           cache: 'pip'
       
-      - name: 安装依赖
+      - name: 安装依赖与中文字体
         run: |
-          pip install --upgrade pip
-          pip install -r requirements.txt
-          python -c "import futu; print('✅ futu SDK import OK')"
+          sudo apt-get update && sudo apt-get install -y fonts-wqy-microhei || true
+          MODE="${{ github.event.inputs.mode || 'ict-sector' }}"
+          if [ "$MODE" = "ict-sector" ]; then
+            pip install requests pillow python-dotenv exchange_calendars pandas
+          else
+            pip install --upgrade pip
+            pip install -r requirements.txt
+          fi
       
       - name: 创建必要目录
         run: |
@@ -450,11 +452,11 @@ jobs:
             echo "✅ LITELLM 配置文件已写入: $LITELLM_CONFIG"
           fi
 
-          # 判断运行模式
-          MODE="${{ github.event.inputs.mode || 'full' }}"
+          # 判断运行模式（定时触发默认走 ict-sector）
+          MODE="${{ github.event.inputs.mode || 'ict-sector' }}"
           
           echo "=========================================="
-          echo "🚀 A股自选股智能分析系统"
+          echo "🚀 A股 ICT 板块结构机会日报系统"
           echo "=========================================="
           echo "⏰ 时间: $(TZ='Asia/Shanghai' date '+%Y-%m-%d %H:%M:%S')"
           echo "🎯 运行模式: $MODE"
@@ -528,6 +530,11 @@ jobs:
             echo "⚡ 已启用强制运行模式（跳过交易日检查）"
           fi
 
+          WAIT_ARG=""
+          if [ "${{ github.event_name }}" = "schedule" ]; then
+            WAIT_ARG="--wait-target-time"
+          fi
+
           # 执行分析
           if [ "$MODE" = "market-only" ]; then
             python main.py --market-review $FORCE_RUN_ARG
@@ -537,18 +544,8 @@ jobs:
             python main.py $FORCE_RUN_ARG
           else
             # 默认模式: ICT 板块结构机会日报（手机端极简，纯板块，图文并茂）
-            python src/services/ict_sector_reporter.py $FORCE_RUN_ARG
+            python src/services/ict_sector_reporter.py $FORCE_RUN_ARG $WAIT_ARG
           fi
-
-      - name: 生成并推送战术复盘长图海报
-        if: always() && (github.event.inputs.mode == 'full' || github.event.inputs.mode == 'market-only')
-        env:
-          FEISHU_APP_ID: ${{ secrets.FEISHU_APP_ID }}
-          FEISHU_APP_SECRET: ${{ secrets.FEISHU_APP_SECRET }}
-          FEISHU_CHAT_ID: ${{ secrets.FEISHU_CHAT_ID }}
-        run: |
-          sudo apt-get install -y fonts-wqy-microhei || true
-          python src/services/poster_sender.py || true
 
       - name: 上传分析报告
         uses: actions/upload-artifact@v6
