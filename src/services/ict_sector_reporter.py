@@ -126,17 +126,15 @@ def check_and_align_trading_time(
     period_arg: Optional[str] = None
 ) -> Tuple[bool, datetime.datetime, str]:
     """
-    时间时效性校验与秒级对齐：
+    时间时效性校验与秒级对齐（仅保留两个核心实盘指导时段）：
     1. 早盘 09:20：开盘前定调与准入计划
     2. 尾盘 14:45：抓取 14:44 快照，为 14:50 尾盘交易决策预留 5 分钟核对仓位与下单
-    3. 盘后 15:20：全天收盘确认，推演明日早盘策略
     """
     now = datetime.datetime.now(CST_TZ)
     current_minutes = now.hour * 60 + now.minute
 
     target_morning = 9 * 60 + 20       # 09:20 (560)
     target_pre_close = 14 * 60 + 45    # 14:45 (885)
-    target_post_market = 15 * 60 + 20  # 15:20 (920)
 
     if period_arg == "morning":
         period_title = "早盘盘前指导 · 结构定调与准入计划 (09:20)"
@@ -144,25 +142,19 @@ def check_and_align_trading_time(
     elif period_arg in ["pre_close", "afternoon"]:
         period_title = "尾盘决策预警 · 交易信号与仓位核对 (14:45)"
         target_m = target_pre_close
-    elif period_arg == "post_market":
-        period_title = "盘后复盘总结 · 收盘确认与明日策略 (15:20)"
-        target_m = target_post_market
     else:
         # 自动判定
         if current_minutes < 12 * 60:
             period_title = "早盘盘前指导 · 结构定调与准入计划 (09:20)"
             target_m = target_morning
-        elif 12 * 60 <= current_minutes < 15 * 60:
+        else:
             period_title = "尾盘决策预警 · 交易信号与仓位核对 (14:45)"
             target_m = target_pre_close
-        else:
-            period_title = "盘后复盘总结 · 收盘确认与明日策略 (15:20)"
-            target_m = target_post_market
 
     if not force_run:
-        # 1. 如果提前到达（提前 1~30 分钟启动），进行精准等待对齐
+        # 1. 如果提前到达（提前 1~40 分钟启动），进行精准等待对齐
         diff = target_m - current_minutes
-        if 0 < diff <= 30:
+        if 0 < diff <= 40:
             target_time = now.replace(hour=target_m // 60, minute=target_m % 60, second=0, microsecond=0)
             wait_sec = (target_time - now).total_seconds()
             if wait_sec > 0:
@@ -177,19 +169,17 @@ def check_and_align_trading_time(
                 current_minutes = now.hour * 60 + now.minute
 
         # 2. 校验是否在有效交易窗口内
-        # 早盘: 09:15~09:35；尾盘决策: 14:40~14:58；盘后复盘: 15:15~15:45
+        # 早盘: 09:15~09:35；尾盘决策: 14:40~14:58
         valid_morning = (9 * 60 + 15 <= current_minutes <= 9 * 60 + 35)
         valid_pre_close = (14 * 60 + 40 <= current_minutes <= 14 * 60 + 58)
-        valid_post_market = (15 * 60 + 15 <= current_minutes <= 15 * 60 + 45)
 
         is_valid = (
             (target_m == target_morning and valid_morning) or
-            (target_m == target_pre_close and valid_pre_close) or
-            (target_m == target_post_market and valid_post_market)
+            (target_m == target_pre_close and valid_pre_close)
         )
         if not is_valid:
             logger.warning(
-                "⏸️ 当前北京时间 %s 不在有效推送窗口 (早盘: 09:15~09:35, 尾盘: 14:40~14:58, 盘后: 15:15~15:45)。"
+                "⏸️ 当前北京时间 %s 不在有效推送窗口 (早盘: 09:15~09:35, 尾盘预警: 14:40~14:58)。"
                 "检测到此任务为延迟严重的陈旧调度，已安全拦截跳过，杜绝错误时间推送！",
                 now.strftime("%H:%M:%S")
             )
@@ -427,17 +417,11 @@ def build_ict_markdown_report(
             f"**早盘准入**：优先关注 130D 折价区（<35%）企稳板块（{('、'.join(disc_sectors[:3])) or '暂无'}）次回踩结构位机会；"
             f"强势板块（{('、'.join(bull_sectors[:2])) or '暂无'}）切勿盲目追高开。"
         )
-    elif "尾盘" in period_title or "14:45" in period_title:
+    else:
+        # 尾盘决策预警 (14:45)
         wait_condition = (
             f"**尾盘决策（14:45 预警）**：距 14:50 仅剩 5 分钟，请立即核对仓位！"
             f"破位偏空板块坚决执行减仓防守；放量突破板块核对入场条件；处于 130D 溢价区（>65%）冲高回落标的锁定浮盈。"
-        )
-    else:
-        # 盘后复盘 (15:20)
-        wait_condition = (
-            f"**今日收盘已确认，明日早盘策略如下**：全天结构已定型。"
-            f"放量反转确认板块（{('、'.join(bull_sectors[:3])) or '暂无'}）列入明日早盘重点观察清单，等次回踩确认；"
-            f"破位及 130D 溢价区（>65%）承压板块坚决规避次日补跌风险。"
         )
 
     badge_map = {"Bullish": "🟢 多头", "Neutral": "🟡 震荡", "Bearish": "🔴 空头"}
@@ -512,8 +496,8 @@ def build_ict_markdown_report(
    - 🔴 **溢价区 (>65%)**: 严禁追高，持仓个股紧随移动止盈线，收长上影线或滞涨放量立即保护利润。
 2. **量能硬性过滤**:
    - 板块 MSS↑ 突破必须伴随放量（成交额/量需大于 20日均量 或 量比 > 1.2），无量突破一律按“弱势待确认”防守，规避电风扇行情诱多。
-3. **分时三维执行**:
-   - 早盘 09:20 定准入基调；尾盘 14:45 抓取快照预留 5 分钟核对仓位并执行；盘后 15:20 确认终局推演次日策略。
+3. **分时双维执行**:
+   - 早盘 09:20 定准入基调；尾盘 14:45 抓取快照预留 5 分钟核对仓位并在 14:50 前从容决策下单。
 """
     return report
 
@@ -579,7 +563,7 @@ def run_ict_pipeline(
 if __name__ == "__main__":
     parser = argparse.ArgumentParser(description="A股 ICT 板块结构机会日报")
     parser.add_argument("--force-run", action="store_true", help="强制运行（跳过交易日与时间窗口检查）")
-    parser.add_argument("--period", choices=["morning", "pre_close", "post_market", "afternoon", "auto"], default="auto", help="运行周期")
+    parser.add_argument("--period", choices=["morning", "pre_close", "afternoon", "auto"], default="auto", help="运行周期")
     parser.add_argument("--wait-target-time", action="store_true", help="启用目标时间精准对齐等待")
     args = parser.parse_args()
 
