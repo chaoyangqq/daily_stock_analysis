@@ -1,12 +1,14 @@
 # -*- coding: utf-8 -*-
 """
-A股 & 港股 ICT 板块结构机会日报系统 (手机端极简 · 09:20 盘前 & 14:50 尾盘)
+A股 & 港股 ICT 板块结构机会日报系统 (手机端纯文本极简 · 09:20 盘前 & 14:50 尾盘)
 核心设计：
-1. 交易日调度：仅在中国交易日执行，早 09:20 发盘前指导，下午 14:50 发尾盘交易指导。
-2. 精准时间对齐：内置目标时刻对齐器，消除 GitHub Actions 排队延迟，准点抓取 09:20 / 14:50 实时行情并推送。
-3. 真实 ICT 结构计算：实时拉取 130D 日线 K 线，计算真实 130D PD 折溢价位置、MA20 动能、40D 摆动高低点与 BOS/MSS/Sweep 结构事件。
-4. 纯板块视角：严禁个股买卖指导，聚焦大盘 Market Regime 与核心板块 Sector Regime。
-5. 图文并茂：推送交互式卡片 + 白底商务科技风战术海报。
+1. 交易日调度：仅在中国 A 股交易日执行，早 09:20 发盘前指导，下午 14:50 发尾盘交易指导。
+2. 精准时间对齐与时效护栏：
+   - 提前启动时自动精准等待至北京时间 09:20:00 或 14:50:00 再拉取最新行情并推送；
+   - 严格窗口拦截（早盘仅限 09:15~09:40，尾盘仅限 14:45~15:10），若遇云端超时严重延迟自动拦截，杜绝在错误时间推送。
+3. 纯文本交互式卡片：按用户要求剔除图片海报，仅发送高信噪比纯文本卡片，手机一屏秒览。
+4. 真实 ICT 结构计算：实时拉取 130D 日 K 线，计算真实 PD 折溢价位置、MA20 动能、40D 摆动高低点与 BOS/MSS/Sweep 结构事件。
+5. 纯板块视角：严禁个股买卖指导，聚焦大盘 Market Regime 与核心板块 Sector Regime。
 """
 
 import os
@@ -27,8 +29,7 @@ BASE_DIR = Path(__file__).resolve().parent.parent.parent
 if str(BASE_DIR) not in sys.path:
     sys.path.insert(0, str(BASE_DIR))
 
-from src.services.visual_card_generator import generate_tactical_poster
-from src.services.poster_sender import send_poster_to_feishu, send_markdown_card_to_feishu
+from src.services.poster_sender import send_markdown_card_to_feishu
 
 logging.basicConfig(
     level=logging.INFO,
@@ -60,31 +61,69 @@ SECTOR_LIST = [
 ]
 
 
-def wait_until_target_cst(max_wait_seconds: int = 1200) -> datetime.datetime:
+def check_and_align_trading_time(
+    force_run: bool = False,
+    period_arg: Optional[str] = None
+) -> Tuple[bool, datetime.datetime, str]:
     """
-    若由 GitHub Actions 提前触发（如 09:05 启动以抵消排队延迟），
-    自动等待至北京时间 09:20:00 或 14:50:00 再拉取最新行情并推送。
+    时间时效性校验与秒级对齐：
+    1. 提前到达时，精准 sleep 至 09:20:00 或 14:50:00；
+    2. 若因云端队列延迟严重（超出交易窗口），自动跳过废弃任务，避免在错误时间打扰；
+    3. 返回 (是否允许执行, 当前对齐时间, 时段标题)。
     """
     now = datetime.datetime.now(CST_TZ)
-    target = None
-    if 8 <= now.hour < 10:
-        target = now.replace(hour=9, minute=20, second=0, microsecond=0)
-    elif 13 <= now.hour < 15:
-        target = now.replace(hour=14, minute=50, second=0, microsecond=0)
+    current_minutes = now.hour * 60 + now.minute
 
-    if target and now < target:
-        wait_sec = (target - now).total_seconds()
-        if 0 < wait_sec <= max_wait_seconds:
-            logger.info(
-                "⏳ 当前北京时间 %s，距离目标推送时间 %s 还有 %.0f 秒，正在精准等待对齐...",
-                now.strftime("%H:%M:%S"),
-                target.strftime("%H:%M:%S"),
-                wait_sec,
+    target_morning = 9 * 60 + 20    # 09:20 (560)
+    target_afternoon = 14 * 60 + 50 # 14:50 (890)
+
+    if period_arg == "morning":
+        period_title = "早盘盘前指导 · 结构定调与准入计划 (09:20)"
+        target_m = target_morning
+    elif period_arg == "afternoon":
+        period_title = "尾盘交易指导 · 关键确认与防守执行 (14:50)"
+        target_m = target_afternoon
+    else:
+        # 自动判定
+        if current_minutes < 12 * 60:
+            period_title = "早盘盘前指导 · 结构定调与准入计划 (09:20)"
+            target_m = target_morning
+        else:
+            period_title = "尾盘交易指导 · 关键确认与防守执行 (14:50)"
+            target_m = target_afternoon
+
+    if not force_run:
+        # 1. 如果提前到达（提前 1~30 分钟启动），进行精准等待对齐
+        diff = target_m - current_minutes
+        if 0 < diff <= 30:
+            target_time = now.replace(hour=target_m // 60, minute=target_m % 60, second=0, microsecond=0)
+            wait_sec = (target_time - now).total_seconds()
+            if wait_sec > 0:
+                logger.info(
+                    "⏳ 当前北京时间 %s，已提前启动，正在精准等待 %.0f 秒对齐至 %s 整点推送...",
+                    now.strftime("%H:%M:%S"),
+                    wait_sec,
+                    target_time.strftime("%H:%M:%S")
+                )
+                time.sleep(wait_sec)
+                now = datetime.datetime.now(CST_TZ)
+                current_minutes = now.hour * 60 + now.minute
+
+        # 2. 校验是否在有效交易窗口内
+        # 早盘窗口: 09:15 ~ 09:40；尾盘窗口: 14:45 ~ 15:10
+        valid_morning = (9 * 60 + 15 <= current_minutes <= 9 * 60 + 40)
+        valid_afternoon = (14 * 60 + 45 <= current_minutes <= 15 * 60 + 10)
+
+        is_valid = (target_m == target_morning and valid_morning) or (target_m == target_afternoon and valid_afternoon)
+        if not is_valid:
+            logger.warning(
+                "⏸️ 当前北京时间 %s 不在有效推送窗口 (早盘窗口: 09:15~09:40, 尾盘窗口: 14:45~15:10)。"
+                "检测到此任务为延迟严重的陈旧调度，已安全拦截跳过，杜绝错误时间推送！",
+                now.strftime("%H:%M:%S")
             )
-            time.sleep(wait_sec)
-            now = datetime.datetime.now(CST_TZ)
-            logger.info("⏰ 已精准到达目标推送时间: %s", now.strftime("%Y-%m-%d %H:%M:%S"))
-    return now
+            return False, now, period_title
+
+    return True, now, period_title
 
 
 def _fetch_kline_130d(symbol: str) -> List[List[str]]:
@@ -100,7 +139,7 @@ def _analyze_ict_bars(bars: List[List[str]]) -> Dict[str, Any]:
     """
     基于 130D 日线 K 线计算真实 ICT 结构指标：
     - 130D 最高/最低与 PD 折溢价百分比 (Discount / Premium)
-    - MA20 均线位置与 ATR20 波动率
+    - MA20 均线位置与动能状态
     - 40D 结构窗口内的摆动高低点突破 (BOS/MSS CONFIRMED vs SWEEP)
     """
     if not bars or len(bars) < 25:
@@ -156,7 +195,6 @@ def _analyze_ict_bars(bars: List[List[str]]) -> Dict[str, Any]:
     max_recent_high = max(x["high"] for x in recent_5)
     min_recent_low = min(x["low"] for x in recent_5)
 
-    # 判断突破确认 (CONFIRMED) 或 假突破扫流动性 (SWEEP)
     sh_date = ref_high["date"][5:]  # MM-DD
     sl_date = ref_low["date"][5:]   # MM-DD
 
@@ -261,8 +299,8 @@ def build_ict_markdown_report(
     data_date: str,
     indices: List[Dict[str, Any]],
     sectors: List[Dict[str, Any]],
-) -> Tuple[str, str, str, str]:
-    """生成手机端高信噪比 ICT 板块结构日报"""
+) -> str:
+    """生成手机端极简纯文本 ICT 板块结构机会日报"""
     bull_cnt = sum(1 for s in sectors if s["regime"] == "Bullish")
     neut_cnt = sum(1 for s in sectors if s["regime"] == "Neutral")
     bear_cnt = sum(1 for s in sectors if s["regime"] == "Bearish")
@@ -288,16 +326,16 @@ def build_ict_markdown_report(
 
     if "早盘" in period_title:
         wait_condition = (
-            f"早盘准入：优先关注折价区企稳板块（{('、'.join(disc_sectors[:3])) or '暂无'}）回踩结构位机会；"
+            f"**早盘准入**：优先关注折价区企稳板块（{('、'.join(disc_sectors[:3])) or '暂无'}）回踩结构位机会；"
             f"强势板块（{('、'.join(bull_sectors[:2])) or '暂无'}）不追溢价高开。"
         )
     else:
         wait_condition = (
-            f"尾盘确认：14:50 检视收盘价是否有效确认结构突破；"
+            f"**尾盘确认**：14:50 检视收盘价是否有效确认结构突破；"
             f"破位偏空板块坚决执行减仓防守，溢价区（>60%）收长上影线锁定利润。"
         )
 
-    badge_map = {"Bullish": "🟢 Bullish", "Neutral": "🟡 Neutral", "Bearish": "🔴 Bearish"}
+    badge_map = {"Bullish": "🟢 多头", "Neutral": "🟡 震荡", "Bearish": "🔴 空头"}
 
     idx_rows = []
     for i in indices:
@@ -317,12 +355,12 @@ def build_ict_markdown_report(
 
     report = f"""# 🧭 ICT 板块结构机会日报
 **【{period_title}】**
-行情日期：{data_date} ｜ 推送时间：{now_str} (北京时间) ｜ 周期：日线 (HTF 130D / 40D)
+📅 行情日期：{data_date} ｜ ⏰ 推送时间：{now_str} (北京时间) ｜ 周期：日线 (130D/40D)
 
 ### 1. 📌 今日核心结论
-- **市场环境**: Market Regime = **{overall_regime}**（{regime_desc}）
-- **板块结构分布**: 🟢 Bullish **{bull_cnt}** 个 ｜ 🟡 Neutral **{neut_cnt}** 个 ｜ 🔴 Bearish **{bear_cnt}** 个
-- **核心行动条件**: {wait_condition}
+- **市场定调**: Market Regime = **{overall_regime}** ({regime_desc})
+- **板块多空分布**: 🟢 多头 **{bull_cnt}** 个 ｜ 🟡 震荡 **{neut_cnt}** 个 ｜ 🔴 空头 **{bear_cnt}** 个
+- **核心操作条件**: {wait_condition}
 
 ### 2. 🌡️ Market Regime（指数结构化判定）
 | 指数 | 趋势 (当日) | 结构证据 (40D) | 均线动能 | 130D PD位置 |
@@ -339,15 +377,14 @@ def build_ict_markdown_report(
 2. **溢价区防守**: 处于 Premium (>60%) 的板块严禁追高，持仓以移动止盈线保护浮盈；
 3. **收盘价确认**: 盘中假突破极多，早盘 09:20 看准入位置，尾盘 14:50 以临近收盘价确认最终去留。
 """
-    return report, overall_regime, regime_desc, wait_condition
+    return report
 
 
 def run_ict_pipeline(
     force_run: bool = False,
     period_arg: Optional[str] = None,
-    wait_target: bool = False,
 ) -> bool:
-    """执行完整的 ICT 板块日报生成与双重推送流程"""
+    """执行纯文本 ICT 板块日报生成与飞书卡片推送流程"""
     load_dotenv()
 
     # 1. 交易日检查
@@ -361,27 +398,22 @@ def run_ict_pipeline(
         except Exception as e:
             logger.warning("交易日日历检查出现异常，继续执行: %s", e)
 
-    # 2. 若开启准点对齐（用于抵消 GitHub Actions 排队延迟），等待至 09:20 或 14:50
-    if wait_target:
-        now_cst = wait_until_target_cst()
-    else:
-        now_cst = datetime.datetime.now(CST_TZ)
+    # 2. 准点对齐与时效性合法窗口检查
+    should_run, now_cst, period_title = check_and_align_trading_time(
+        force_run=force_run,
+        period_arg=period_arg
+    )
+    if not should_run:
+        return True
 
     now_str = now_cst.strftime("%Y-%m-%d %H:%M")
-    hour = now_cst.hour
-
-    if period_arg == "morning" or (period_arg is None and hour < 12):
-        period_title = "早盘盘前指导 · 结构定调与准入计划 (09:20)"
-    else:
-        period_title = "尾盘交易指导 · 关键确认与防守执行 (14:50)"
-
     logger.info("🚀 启动 ICT 板块结构机会日报流水线: %s [%s]", now_str, period_title)
 
     # 3. 实时拉取 130D K 线并计算真实 ICT 指标
     indices, sectors, data_date = fetch_and_compute_ict_data()
 
-    # 4. 生成极简手机版 Markdown 报告
-    markdown_report, overall_regime, regime_desc, wait_condition = build_ict_markdown_report(
+    # 4. 生成极简手机版纯文本 Markdown 报告（无图片）
+    markdown_report = build_ict_markdown_report(
         period_title=period_title,
         now_str=now_str,
         data_date=data_date,
@@ -389,47 +421,31 @@ def run_ict_pipeline(
         sectors=sectors,
     )
 
-    # 保存报告文件
+    # 5. 保存报告文件
     os.makedirs("reports", exist_ok=True)
     report_filename = f"reports/ict_sector_{now_cst.strftime('%Y%m%d_%H%M')}.md"
     with open(report_filename, "w", encoding="utf-8") as f:
         f.write(markdown_report)
     logger.info("📄 报告已保存至: %s", report_filename)
 
-    # 5. 生成白底商务科技风战术海报
-    poster_path = "reports/tactical_poster.png"
-    generate_tactical_poster(
-        output_path=poster_path,
-        period_title=period_title,
-        report_date=f"{data_date} (推送 {now_cst.strftime('%H:%M')} CST)",
-        overall_regime=overall_regime,
-        regime_desc=regime_desc,
-        wait_condition=wait_condition,
-        indices=indices,
-        sectors=sectors,
-    )
-
-    # 6. 图文并茂推送到飞书
+    # 6. 推送纯文本交互式卡片到飞书（用户要求不需要图片，仅发送文本卡片）
     card_ok = send_markdown_card_to_feishu(
         content=markdown_report,
         title=f"🧭 ICT 板块结构机会日报 ({period_title.split('·')[0].strip()})"
     )
-    poster_ok = send_poster_to_feishu(image_path=poster_path)
 
-    logger.info("🏁 ICT 流程执行完毕！卡片推送: %s, 海报推送: %s", card_ok, poster_ok)
-    return card_ok and poster_ok
+    logger.info("🏁 ICT 纯文本日报推送完毕！推送状态: %s", card_ok)
+    return card_ok
 
 
 if __name__ == "__main__":
     parser = argparse.ArgumentParser(description="A股 ICT 板块结构机会日报")
-    parser.add_argument("--force-run", action="store_true", help="强制运行（跳过交易日检查）")
-    parser.add_argument("--wait-target-time", action="store_true", help="若提前启动，精准等待至 09:20 或 14:50 CST 再执行")
+    parser.add_argument("--force-run", action="store_true", help="强制运行（跳过交易日与时间窗口检查）")
     parser.add_argument("--period", choices=["morning", "afternoon", "auto"], default="auto", help="运行周期")
     args = parser.parse_args()
 
     success = run_ict_pipeline(
         force_run=args.force_run,
         period_arg=None if args.period == "auto" else args.period,
-        wait_target=args.wait_target_time,
     )
     sys.exit(0 if success else 1)

@@ -15,7 +15,7 @@ on:
         default: 'ict-sector'
         type: choice
         options:
-          - ict-sector    # ICT 板块结构机会日报（纯板块+手机端图文并茂）
+          - ict-sector    # ICT 板块结构机会日报（纯板块+手机端纯文本极简）
           - full          # 完整分析（股票+大盘）
           - market-only   # 仅大盘复盘
           - stocks-only   # 仅股票分析
@@ -49,12 +49,11 @@ jobs:
           python-version: '3.11'
           cache: 'pip'
       
-      - name: 安装依赖与中文字体
+      - name: 安装轻量依赖
         run: |
-          sudo apt-get update && sudo apt-get install -y fonts-wqy-microhei || true
           MODE="${{ github.event.inputs.mode || 'ict-sector' }}"
           if [ "$MODE" = "ict-sector" ]; then
-            pip install requests pillow python-dotenv exchange_calendars pandas
+            pip install requests python-dotenv exchange_calendars pandas
           else
             pip install --upgrade pip
             pip install -r requirements.txt
