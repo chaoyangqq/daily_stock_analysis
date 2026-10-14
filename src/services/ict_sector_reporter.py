@@ -127,30 +127,37 @@ def check_and_align_trading_time(
 ) -> Tuple[bool, datetime.datetime, str]:
     """
     时间时效性校验与秒级对齐：
-    1. 提前到达时，精准 sleep 至 09:20:00 或 14:50:00；
-    2. 若因云端队列延迟严重（超出交易窗口），自动跳过废弃任务，避免在错误时间打扰；
-    3. 返回 (是否允许执行, 当前对齐时间, 时段标题)。
+    1. 早盘 09:20：开盘前定调与准入计划
+    2. 尾盘 14:45：抓取 14:44 快照，为 14:50 尾盘交易决策预留 5 分钟核对仓位与下单
+    3. 盘后 15:20：全天收盘确认，推演明日早盘策略
     """
     now = datetime.datetime.now(CST_TZ)
     current_minutes = now.hour * 60 + now.minute
 
-    target_morning = 9 * 60 + 20    # 09:20 (560)
-    target_afternoon = 14 * 60 + 50 # 14:50 (890)
+    target_morning = 9 * 60 + 20       # 09:20 (560)
+    target_pre_close = 14 * 60 + 45    # 14:45 (885)
+    target_post_market = 15 * 60 + 20  # 15:20 (920)
 
     if period_arg == "morning":
         period_title = "早盘盘前指导 · 结构定调与准入计划 (09:20)"
         target_m = target_morning
-    elif period_arg == "afternoon":
-        period_title = "尾盘交易指导 · 关键确认与防守执行 (14:50)"
-        target_m = target_afternoon
+    elif period_arg in ["pre_close", "afternoon"]:
+        period_title = "尾盘决策预警 · 交易信号与仓位核对 (14:45)"
+        target_m = target_pre_close
+    elif period_arg == "post_market":
+        period_title = "盘后复盘总结 · 收盘确认与明日策略 (15:20)"
+        target_m = target_post_market
     else:
         # 自动判定
         if current_minutes < 12 * 60:
             period_title = "早盘盘前指导 · 结构定调与准入计划 (09:20)"
             target_m = target_morning
+        elif 12 * 60 <= current_minutes < 15 * 60:
+            period_title = "尾盘决策预警 · 交易信号与仓位核对 (14:45)"
+            target_m = target_pre_close
         else:
-            period_title = "尾盘交易指导 · 关键确认与防守执行 (14:50)"
-            target_m = target_afternoon
+            period_title = "盘后复盘总结 · 收盘确认与明日策略 (15:20)"
+            target_m = target_post_market
 
     if not force_run:
         # 1. 如果提前到达（提前 1~30 分钟启动），进行精准等待对齐
@@ -170,14 +177,19 @@ def check_and_align_trading_time(
                 current_minutes = now.hour * 60 + now.minute
 
         # 2. 校验是否在有效交易窗口内
-        # 早盘窗口: 09:15 ~ 09:35；尾盘窗口: 14:45 ~ 15:05
+        # 早盘: 09:15~09:35；尾盘决策: 14:40~14:58；盘后复盘: 15:15~15:45
         valid_morning = (9 * 60 + 15 <= current_minutes <= 9 * 60 + 35)
-        valid_afternoon = (14 * 60 + 45 <= current_minutes <= 15 * 60 + 5)
+        valid_pre_close = (14 * 60 + 40 <= current_minutes <= 14 * 60 + 58)
+        valid_post_market = (15 * 60 + 15 <= current_minutes <= 15 * 60 + 45)
 
-        is_valid = (target_m == target_morning and valid_morning) or (target_m == target_afternoon and valid_afternoon)
+        is_valid = (
+            (target_m == target_morning and valid_morning) or
+            (target_m == target_pre_close and valid_pre_close) or
+            (target_m == target_post_market and valid_post_market)
+        )
         if not is_valid:
             logger.warning(
-                "⏸️ 当前北京时间 %s 不在有效推送窗口 (早盘窗口: 09:15~09:35, 尾盘窗口: 14:45~15:05)。"
+                "⏸️ 当前北京时间 %s 不在有效推送窗口 (早盘: 09:15~09:35, 尾盘: 14:40~14:58, 盘后: 15:15~15:45)。"
                 "检测到此任务为延迟严重的陈旧调度，已安全拦截跳过，杜绝错误时间推送！",
                 now.strftime("%H:%M:%S")
             )
@@ -197,9 +209,10 @@ def _fetch_kline_130d(symbol: str) -> List[List[str]]:
 
 def _analyze_ict_bars(bars: List[List[str]]) -> Dict[str, Any]:
     """
-    基于 130D 日线 K 线计算真实 ICT 结构指标：
-    - 130D 最高/最低与 PD 折溢价百分比 (Discount / Premium)
+    基于 130D 日线 K 线与成交量计算真实 ICT 结构指标：
+    - 130D 最高/最低与分位值 (折价区 <35% / 平衡区 35~65% / 溢价区 >65%)
     - MA20 均线位置与动能状态
+    - 20日均量与量比计算，硬性过滤 MSS↑ 突破（成交额/量需大于20日均量 或 量比>1.2，否则降级为弱势待确认）
     - 40D 结构窗口内的摆动高低点突破 (BOS/MSS CONFIRMED vs SWEEP)
     """
     if not bars or len(bars) < 25:
@@ -209,12 +222,14 @@ def _analyze_ict_bars(bars: List[List[str]]) -> Dict[str, Any]:
     for b in bars:
         if len(b) < 5:
             continue
+        vol = float(b[5]) if len(b) > 5 and b[5] else 0.0
         parsed.append({
             "date": b[0],
             "open": float(b[1]),
             "close": float(b[2]),
             "high": float(b[3]),
             "low": float(b[4]),
+            "volume": vol,
         })
 
     latest = parsed[-1]
@@ -222,21 +237,36 @@ def _analyze_ict_bars(bars: List[List[str]]) -> Dict[str, Any]:
     curr_close = latest["close"]
     chg_pct = ((curr_close - prev["close"]) / prev["close"] * 100.0) if prev["close"] else 0.0
 
-    # 1. 130D Range & PD Location
+    # 1. 130D Range & 统一分位值文案（消除语义歧义）
     high_130 = max(x["high"] for x in parsed)
     low_130 = min(x["low"] for x in parsed)
     pd_pct = ((curr_close - low_130) / (high_130 - low_130) * 100.0) if high_130 > low_130 else 50.0
     pd_pct = max(0.0, min(100.0, pd_pct))
-    is_discount = pd_pct < 50.0
-    pd_cn = f"{pd_pct:.1f}% {'折价' if is_discount else '溢价'}"
-    pd_en = f"PD {pd_pct:.1f}% {'Discount' if is_discount else 'Premium'} ({curr_close:.2f})"
+
+    if pd_pct < 35.0:
+        pd_zone = "折价区"
+    elif pd_pct > 65.0:
+        pd_zone = "溢价区"
+    else:
+        pd_zone = "平衡区"
+
+    pd_quantile_str = f"130D 分位值: {pd_pct:.1f}% ({pd_zone})"
 
     # 2. MA20 & Momentum
     ma20 = sum(x["close"] for x in parsed[-20:]) / 20.0
     above_ma20 = curr_close >= ma20
     ma_desc = "MA20 上方 · 偏强" if above_ma20 else "MA20 下方 · 承压"
 
-    # 3. 40D Structure Window: Swing Highs & Swing Lows
+    # 3. 20日均量与量比因子 (硬性过滤电风扇行情假突破)
+    hist_bars = parsed[:-1]
+    prior_20_bars = hist_bars[-20:] if len(hist_bars) >= 20 else hist_bars
+    ma20_vol = (sum(x["volume"] for x in prior_20_bars) / len(prior_20_bars)) if prior_20_bars else 1.0
+    latest_vol = latest["volume"]
+    vol_ratio = (latest_vol / ma20_vol) if ma20_vol > 0 else 1.0
+    # 放量硬性条件：当日成交量/成交额 > 20日均量 或 量比 > 1.2
+    is_volume_confirmed = (latest_vol >= ma20_vol) or (vol_ratio >= 1.2)
+
+    # 4. 40D Structure Window: Swing Highs & Swing Lows
     win_40 = parsed[-42:-2] if len(parsed) >= 42 else parsed[:-2]
     swing_highs = []
     swing_lows = []
@@ -258,35 +288,42 @@ def _analyze_ict_bars(bars: List[List[str]]) -> Dict[str, Any]:
     sh_date = ref_high["date"][5:]  # MM-DD
     sl_date = ref_low["date"][5:]   # MM-DD
 
+    # 多头结构反转硬性量能过滤
     if curr_close > ref_high["high"]:
-        regime = "Bullish"
-        event = f"MSS↑ CONFIRMED @{latest['date'][5:]}"
-        advice = "顺势跟随 设防" if pd_pct < 70 else "溢价勿追 移动止盈"
+        if is_volume_confirmed:
+            regime = "Bullish"
+            event = f"MSS↑ CONFIRMED (放量/量比{vol_ratio:.1f} @{latest['date'][5:]})"
+            advice = "顺势跟随 · 设移动防守" if pd_pct < 65.0 else "溢价放量 · 谨防冲高回落"
+        else:
+            # 缩量电风扇行情：硬性降级为弱势待确认
+            regime = "Neutral"
+            event = f"MSS↑ 弱势待确认 (缩量/量比{vol_ratio:.1f} @{latest['date'][5:]})"
+            advice = "缩量防假突破 · 暂不追高"
     elif curr_close < ref_low["low"]:
         regime = "Bearish"
         event = f"BOS↓ CONFIRMED @{latest['date'][5:]}"
-        advice = "严守防守位 减仓"
+        advice = "严守防守位 · 破位减仓"
     elif min_recent_low < ref_low["low"] and curr_close >= ref_low["low"]:
         regime = "Neutral"
         event = f"BOS↓ SWEEP @{sl_date} 假破回抽"
-        advice = "折价观察 等确认" if is_discount else "区间震荡 观望"
+        advice = "折价观察 · 等放量确认" if pd_zone == "折价区" else "区间震荡 · 保持观望"
     elif max_recent_high > ref_high["high"] and curr_close <= ref_high["high"]:
         regime = "Neutral"
         event = f"MSS↑ FAILED @{sh_date} 冲高回落"
-        advice = "逢高防守 勿追"
+        advice = "逢高防守 · 勿追"
     else:
         if above_ma20 and chg_pct > 0.3:
-            regime = "Bullish" if pd_pct < 75 else "Neutral"
+            regime = "Bullish" if pd_pct < 75.0 else "Neutral"
             event = f"MA20上方延续 (前高@{sh_date})"
-            advice = "顺势持有 设防"
+            advice = "顺势持有 · 紧随防守"
         elif not above_ma20 and curr_close < (ref_high["high"] + ref_low["low"]) / 2:
             regime = "Bearish"
             event = f"Bear MSS 延续 (受制@{sh_date})"
-            advice = "防守观望 勿抄底"
+            advice = "防守观望 · 勿盲目猜底"
         else:
             regime = "Neutral"
-            event = f"区间缩量整理 (支撑@{sl_date})"
-            advice = "折价区观察 勿追" if is_discount else "多看少动 观望"
+            event = f"区间整理 (支撑@{sl_date})"
+            advice = "折价区观察 · 勿追" if pd_zone == "折价区" else "多看少动 · 观望"
 
     sign = "+" if chg_pct > 0 else ""
     return {
@@ -298,9 +335,10 @@ def _analyze_ict_bars(bars: List[List[str]]) -> Dict[str, Any]:
         "evidence": event,
         "event": event,
         "momentum": ma_desc,
-        "pd": pd_cn,
+        "pd": pd_quantile_str,
         "pd_pct": pd_pct,
-        "location": pd_en,
+        "pd_zone": pd_zone,
+        "vol_ratio": vol_ratio,
         "advice": advice,
         "latest_date": latest["date"],
     }
@@ -360,7 +398,7 @@ def build_ict_markdown_report(
     indices: List[Dict[str, Any]],
     sectors: List[Dict[str, Any]],
 ) -> str:
-    """生成手机端极简纯文本 ICT 板块结构机会日报"""
+    """生成手机端极简纯文本 ICT 板块结构机会日报（文本对齐列表与结构化卡片，彻底避免表格乱码）"""
     bull_cnt = sum(1 for s in sectors if s["regime"] == "Bullish")
     neut_cnt = sum(1 for s in sectors if s["regime"] == "Neutral")
     bear_cnt = sum(1 for s in sectors if s["regime"] == "Bearish")
@@ -373,8 +411,8 @@ def build_ict_markdown_report(
     else:
         overall_regime = "Neutral"
 
-    sh_idx = indices[0] if indices else {"name": "上证指数", "evidence": "-", "momentum": "-", "price": "-"}
-    hs_idx = indices[1] if len(indices) > 1 else {"name": "沪深300", "evidence": "-", "momentum": "-", "price": "-"}
+    sh_idx = indices[0] if indices else {"name": "上证指数", "evidence": "-", "momentum": "-", "price": "-", "change": "0.00%", "pd": "130D 分位值: 50.0% (平衡区)"}
+    hs_idx = indices[1] if len(indices) > 1 else {"name": "沪深300", "evidence": "-", "momentum": "-", "price": "-", "change": "0.00%", "pd": "130D 分位值: 50.0% (平衡区)"}
 
     regime_desc = (
         f"上证({sh_idx['price']}) {sh_idx['evidence']}，沪深300({hs_idx['price']}) {hs_idx['evidence']}；"
@@ -382,60 +420,100 @@ def build_ict_markdown_report(
     )
 
     bull_sectors = [s["name"] for s in sectors if s["regime"] == "Bullish"]
-    disc_sectors = [s["name"] for s in sectors if s.get("pd_pct", 50) < 30 and s["regime"] != "Bearish"]
+    disc_sectors = [s["name"] for s in sectors if s.get("pd_zone") == "折价区" and s["regime"] != "Bearish"]
 
     if "早盘" in period_title:
         wait_condition = (
-            f"**早盘准入**：优先关注折价区企稳板块（{('、'.join(disc_sectors[:3])) or '暂无'}）回踩结构位机会；"
-            f"强势板块（{('、'.join(bull_sectors[:2])) or '暂无'}）不追溢价高开。"
+            f"**早盘准入**：优先关注 130D 折价区（<35%）企稳板块（{('、'.join(disc_sectors[:3])) or '暂无'}）次回踩结构位机会；"
+            f"强势板块（{('、'.join(bull_sectors[:2])) or '暂无'}）切勿盲目追高开。"
+        )
+    elif "尾盘" in period_title or "14:45" in period_title:
+        wait_condition = (
+            f"**尾盘决策（14:45 预警）**：距 14:50 仅剩 5 分钟，请立即核对仓位！"
+            f"破位偏空板块坚决执行减仓防守；放量突破板块核对入场条件；处于 130D 溢价区（>65%）冲高回落标的锁定浮盈。"
         )
     else:
+        # 盘后复盘 (15:20)
         wait_condition = (
-            f"**尾盘确认**：14:50 检视收盘价是否有效确认结构突破；"
-            f"破位偏空板块坚决执行减仓防守，溢价区（>60%）收长上影线锁定利润。"
+            f"**今日收盘已确认，明日早盘策略如下**：全天结构已定型。"
+            f"放量反转确认板块（{('、'.join(bull_sectors[:3])) or '暂无'}）列入明日早盘重点观察清单，等次回踩确认；"
+            f"破位及 130D 溢价区（>65%）承压板块坚决规避次日补跌风险。"
         )
 
     badge_map = {"Bullish": "🟢 多头", "Neutral": "🟡 震荡", "Bearish": "🔴 空头"}
 
-    idx_rows = []
+    # 1. 大盘指数对齐条目列表（免 markdown table 源码裸露）
+    idx_list = []
     for i in indices:
         b = badge_map.get(i["trend"], i["trend"])
-        idx_rows.append(
-            f"| **{i['name']}** | {b} ({i['change']}) | {i['evidence']} | {i['momentum']} | {i['pd']} ({i['price']}) |"
+        idx_list.append(
+            f"• **{i['name']}** ({i['price']}, {i['change']}) {b}\n"
+            f"  └ 结构: {i['evidence']} ｜ 动能: {i['momentum']} ｜ {i['pd']}"
         )
-    idx_table = "\n".join(idx_rows)
+    idx_formatted = "\n".join(idx_list)
 
-    sec_rows = []
-    for s in sectors:
-        b = badge_map.get(s["regime"], s["regime"])
-        sec_rows.append(
-            f"| **{s['name']}** | {b} ({s['change']}) | {s['pd']} | {s['event']} | {s['advice']} |"
-        )
-    sec_table = "\n".join(sec_rows)
+    # 2. 板块按多空状态分类结构化列表
+    bull_items = [s for s in sectors if s["regime"] == "Bullish"]
+    neut_items = [s for s in sectors if s["regime"] == "Neutral"]
+    bear_items = [s for s in sectors if s["regime"] == "Bearish"]
+
+    sec_blocks = []
+    if bull_items:
+        lines = [f"🟢 **多头趋势板块 ({len(bull_items)})**:"]
+        for s in bull_items:
+            lines.append(
+                f"• **{s['name']}** ({s['change']})\n"
+                f"  ├ 结构: {s['event']} ｜ {s['pd']}\n"
+                f"  └ 战术: {s['advice']}"
+            )
+        sec_blocks.append("\n".join(lines))
+
+    if neut_items:
+        lines = [f"🟡 **震荡/观察板块 ({len(neut_items)})**:"]
+        for s in neut_items:
+            lines.append(
+                f"• **{s['name']}** ({s['change']})\n"
+                f"  ├ 结构: {s['event']} ｜ {s['pd']}\n"
+                f"  └ 战术: {s['advice']}"
+            )
+        sec_blocks.append("\n".join(lines))
+
+    if bear_items:
+        lines = [f"🔴 **空头/承压板块 ({len(bear_items)})**:"]
+        for s in bear_items:
+            lines.append(
+                f"• **{s['name']}** ({s['change']})\n"
+                f"  ├ 结构: {s['event']} ｜ {s['pd']}\n"
+                f"  └ 战术: {s['advice']}"
+            )
+        sec_blocks.append("\n".join(lines))
+
+    sec_formatted = "\n\n".join(sec_blocks)
 
     report = f"""# 🧭 ICT 板块结构机会日报
 **【{period_title}】**
 📅 行情日期：{data_date} ｜ ⏰ 推送时间：{now_str} (北京时间) ｜ 周期：日线 (130D/40D)
 
-### 1. 📌 今日核心结论
+### 1. 📌 核心结论与时效决策
 - **市场定调**: Market Regime = **{overall_regime}** ({regime_desc})
-- **板块多空分布**: 🟢 多头 **{bull_cnt}** 个 ｜ 🟡 震荡 **{neut_cnt}** 个 ｜ 🔴 空头 **{bear_cnt}** 个
+- **板块多空分布**: 🟢 多头 **{bull_cnt}** ｜ 🟡 震荡 **{neut_cnt}** ｜ 🔴 空头 **{bear_cnt}**
 - **核心操作条件**: {wait_condition}
 
-### 2. 🌡️ Market Regime（指数结构化判定）
-| 指数 | 趋势 (当日) | 结构证据 (40D) | 均线动能 | 130D PD位置 |
-| :--- | :--- | :--- | :--- | :--- |
-{idx_table}
+### 2. 🌡️ Market Regime（大盘指数结构判定）
+{idx_formatted}
 
-### 3. 🧭 Sector Regime（核心板块多空表 · 纯板块指导）
-| 板块 | 评级 (当日) | 130D PD区间 | 关键结构事件 | 战术建议 |
-| :--- | :--- | :--- | :--- | :--- |
-{sec_table}
+### 3. 🧭 Sector Regime（核心板块多空状态）
+{sec_formatted}
 
 ### 4. 🛡️ 操盘战术护栏
-1. **折价区准入**: 仅在 Discount (<35%) 且出现 MSS↑/Sweep 收盘确认时布局，严禁在 Bearish 破位期左侧盲目猜底；
-2. **溢价区防守**: 处于 Premium (>60%) 的板块严禁追高，持仓以移动止盈线保护浮盈；
-3. **收盘价确认**: 盘中假突破极多，早盘 09:20 看准入位置，尾盘 14:50 以临近收盘价确认最终去留。
+1. **分位值区间准入**:
+   - 🟢 **折价区 (<35%)**: 仅在放量 MSS↑ 或 Sweep 假破收盘回抽时右侧建仓，严禁在破位期盲目猜底；
+   - 🟡 **平衡区 (35%~65%)**: 区间震荡对待，高抛低吸严格控制单笔仓位；
+   - 🔴 **溢价区 (>65%)**: 严禁追高，持仓个股紧随移动止盈线，收长上影线或滞涨放量立即保护利润。
+2. **量能硬性过滤**:
+   - 板块 MSS↑ 突破必须伴随放量（成交额/量需大于 20日均量 或 量比 > 1.2），无量突破一律按“弱势待确认”防守，规避电风扇行情诱多。
+3. **分时三维执行**:
+   - 早盘 09:20 定准入基调；尾盘 14:45 抓取快照预留 5 分钟核对仓位并执行；盘后 15:20 确认终局推演次日策略。
 """
     return report
 
@@ -501,7 +579,7 @@ def run_ict_pipeline(
 if __name__ == "__main__":
     parser = argparse.ArgumentParser(description="A股 ICT 板块结构机会日报")
     parser.add_argument("--force-run", action="store_true", help="强制运行（跳过交易日与时间窗口检查）")
-    parser.add_argument("--period", choices=["morning", "afternoon", "auto"], default="auto", help="运行周期")
+    parser.add_argument("--period", choices=["morning", "pre_close", "post_market", "afternoon", "auto"], default="auto", help="运行周期")
     parser.add_argument("--wait-target-time", action="store_true", help="启用目标时间精准对齐等待")
     args = parser.parse_args()
 
