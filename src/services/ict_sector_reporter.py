@@ -29,7 +29,67 @@ BASE_DIR = Path(__file__).resolve().parent.parent.parent
 if str(BASE_DIR) not in sys.path:
     sys.path.insert(0, str(BASE_DIR))
 
-from src.services.poster_sender import send_markdown_card_to_feishu
+def send_markdown_card_to_feishu(
+    content: str,
+    title: str = "ICT 板块结构机会日报",
+    app_id: str = None,
+    app_secret: str = None,
+    chat_id: str = None
+) -> bool:
+    """发送纯文本交互式卡片消息到飞书群"""
+    app_id = app_id or os.getenv("FEISHU_APP_ID")
+    app_secret = app_secret or os.getenv("FEISHU_APP_SECRET")
+    chat_id = chat_id or os.getenv("FEISHU_CHAT_ID")
+
+    if not app_id or not app_secret or not chat_id:
+        logger.warning("[FeishuSender] 缺少飞书凭据，跳过卡片推送")
+        return False
+
+    try:
+        auth_res = requests.post(
+            "https://open.feishu.cn/open-apis/auth/v3/tenant_access_token/internal",
+            json={"app_id": app_id, "app_secret": app_secret},
+            timeout=10
+        ).json()
+        token = auth_res.get("tenant_access_token")
+        if not token:
+            logger.error("[FeishuSender] 获取飞书 tenant_access_token 失败: %s", auth_res)
+            return False
+
+        card = {
+            "config": {"wide_screen_mode": True},
+            "header": {
+                "title": {"tag": "plain_text", "content": title},
+                "template": "blue"
+            },
+            "elements": [
+                {
+                    "tag": "div",
+                    "text": {"tag": "lark_md", "content": content}
+                }
+            ]
+        }
+
+        send_res = requests.post(
+            "https://open.feishu.cn/open-apis/im/v1/messages?receive_id_type=chat_id",
+            headers={"Authorization": f"Bearer {token}", "Content-Type": "application/json"},
+            json={
+                "receive_id": chat_id,
+                "msg_type": "interactive",
+                "content": json.dumps(card, ensure_ascii=False)
+            },
+            timeout=15
+        ).json()
+
+        if send_res.get("code") == 0:
+            logger.info("✅ 飞书纯文本交互式卡片已成功推送！")
+            return True
+        else:
+            logger.error("飞书卡片消息发送失败: %s", send_res)
+            return False
+    except Exception as e:
+        logger.exception("发送卡片异常: %s", e)
+        return False
 
 logging.basicConfig(
     level=logging.INFO,
