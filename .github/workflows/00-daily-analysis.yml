@@ -542,7 +542,7 @@ jobs:
           elif [ "$MODE" = "full" ]; then
             python main.py $FORCE_RUN_ARG
           else
-            # 默认模式: ICT 板块结构机会日报（手机端极简，纯板块，图文并茂）
+            # 默认模式: ICT 板块结构机会日报（手机端极简，纯板块纯文本卡片，无图片）
             python src/services/ict_sector_reporter.py $FORCE_RUN_ARG $WAIT_ARG
           fi
 

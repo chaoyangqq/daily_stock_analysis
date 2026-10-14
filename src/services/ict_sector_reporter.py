@@ -170,14 +170,14 @@ def check_and_align_trading_time(
                 current_minutes = now.hour * 60 + now.minute
 
         # 2. 校验是否在有效交易窗口内
-        # 早盘窗口: 09:15 ~ 09:40；尾盘窗口: 14:45 ~ 15:10
-        valid_morning = (9 * 60 + 15 <= current_minutes <= 9 * 60 + 40)
-        valid_afternoon = (14 * 60 + 45 <= current_minutes <= 15 * 60 + 10)
+        # 早盘窗口: 09:15 ~ 09:35；尾盘窗口: 14:45 ~ 15:05
+        valid_morning = (9 * 60 + 15 <= current_minutes <= 9 * 60 + 35)
+        valid_afternoon = (14 * 60 + 45 <= current_minutes <= 15 * 60 + 5)
 
         is_valid = (target_m == target_morning and valid_morning) or (target_m == target_afternoon and valid_afternoon)
         if not is_valid:
             logger.warning(
-                "⏸️ 当前北京时间 %s 不在有效推送窗口 (早盘窗口: 09:15~09:40, 尾盘窗口: 14:45~15:10)。"
+                "⏸️ 当前北京时间 %s 不在有效推送窗口 (早盘窗口: 09:15~09:35, 尾盘窗口: 14:45~15:05)。"
                 "检测到此任务为延迟严重的陈旧调度，已安全拦截跳过，杜绝错误时间推送！",
                 now.strftime("%H:%M:%S")
             )
@@ -502,6 +502,7 @@ if __name__ == "__main__":
     parser = argparse.ArgumentParser(description="A股 ICT 板块结构机会日报")
     parser.add_argument("--force-run", action="store_true", help="强制运行（跳过交易日与时间窗口检查）")
     parser.add_argument("--period", choices=["morning", "afternoon", "auto"], default="auto", help="运行周期")
+    parser.add_argument("--wait-target-time", action="store_true", help="启用目标时间精准对齐等待")
     args = parser.parse_args()
 
     success = run_ict_pipeline(
